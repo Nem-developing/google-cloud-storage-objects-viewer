@@ -75,17 +75,20 @@ def catch_all(subpath):
     files = []
 
     for blob in blobs:
+        ###################################################
         file_path = blob.name[len(FOLDER_SRC):]
         path_parents = get_split(file_path)
         deep = file_path.count('/')
         file_size = bytes_to_human_readable(blob.size)
-        is_a_file = path_is_a_file(file_path) 
-        blob_name = get_blob_name(file_path, is_a_file)
-        blob_id = blob.id
-        url = define_url(blob_name,subpath,is_a_file)
+        is_a_file = path_is_a_file(file_path)
+        ###################################################
 
+        blob_name = get_blob_name(file_path, is_a_file)
+        url = define_url(blob_name,subpath,is_a_file)
+        #
         creation_time = blob.time_created.strftime("%A %d %B %Y à %H:%M")
         last_modified = blob.updated.strftime("%A %d %B %Y à %H:%M")
+        ###################################################
 
         file_info = {
             'path': file_path,
@@ -99,9 +102,13 @@ def catch_all(subpath):
             'last_modified': last_modified,
         }
         deep_in_sub = subpath.count('/')
-        if ((is_a_file == True and deep == (0+deep_in_sub)) or (is_a_file == False and deep == (1+deep_in_sub))):
-            files.append(file_info)
-
+        print(is_a_file)        
+        if (is_a_file == True):
+            if (deep == deep_in_sub):
+                files.append(file_info)
+        elif (is_a_file == False):
+            if (deep == (deep_in_sub + 1)):
+                files.append(file_info)
 
     return render_template('index.html', files=files, subpath=subpath, title=TITLE)
 
