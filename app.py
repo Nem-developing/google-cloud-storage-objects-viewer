@@ -8,6 +8,7 @@ BUCKET_NAME = os.getenv('BUCKET_NAME')
 FOLDER_SRC = os.getenv('FOLDER_SRC')
 PUB_URL = os.getenv('PUB_URL')
 TITLE = os.getenv('TITLE')
+version = "1.2"
 
 ### VALUES MUST BE LIKE THAT :
 #BUCKET_NAME = 'prod-nehemiebarkia-publique'
@@ -110,7 +111,7 @@ def catch_all(subpath):
             if (deep == (deep_in_sub + 1)):
                 files.append(file_info)
 
-    return render_template('index.html', files=files, subpath=subpath, title=TITLE)
+    return render_template('index.html', files=files, subpath=subpath, title=TITLE, version=version)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
