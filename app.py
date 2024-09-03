@@ -8,7 +8,7 @@ BUCKET_NAME = os.getenv('BUCKET_NAME')
 FOLDER_SRC = os.getenv('FOLDER_SRC')
 PUB_URL = os.getenv('PUB_URL')
 TITLE = os.getenv('TITLE')
-version = "1.2"
+version = "1.3"
 
 ### VALUES MUST BE LIKE THAT :
 #BUCKET_NAME = 'prod-nehemiebarkia-publique'
@@ -103,7 +103,6 @@ def catch_all(subpath):
             'last_modified': last_modified,
         }
         deep_in_sub = subpath.count('/')
-        print(is_a_file)        
         if (is_a_file == True):
             if (deep == deep_in_sub):
                 files.append(file_info)
