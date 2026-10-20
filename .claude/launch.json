@@ -6,6 +6,12 @@
       "runtimeExecutable": "docker",
       "runtimeArgs": ["run", "--rm", "--name", "gcs-viewer-preview", "--env-file", "variables.env", "-p", "8080:8080", "gcs-list"],
       "port": 8080
+    },
+    {
+      "name": "gcs-viewer (uv)",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "flask", "--app", "app", "--env-file", "variables.env", "run", "--debug", "--port", "8081"],
+      "port": 8081
     }
   ]
 }

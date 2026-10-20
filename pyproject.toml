@@ -1,0 +1,20 @@
+[project]
+name = "google-cloud-storage-objects-viewer"
+version = "2.1"
+description = "Easy Way To Dispay The Content Of PUBLIC Google Cloud Storage Bucket"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flask>=3.1.3",
+    "google-cloud-storage>=3.17.1",
+    "gunicorn>=26.2.0",
+    "tzdata>=2026.5",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "python-dotenv>=1.2.4",
+]

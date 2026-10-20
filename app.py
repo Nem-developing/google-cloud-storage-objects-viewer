@@ -1,4 +1,6 @@
 import os
+import tomllib
+from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -7,7 +9,8 @@ from google.api_core.exceptions import GoogleAPIError
 from google.auth.exceptions import DefaultCredentialsError
 from google.cloud import storage
 
-VERSION = "2.0"
+with open(Path(__file__).with_name('pyproject.toml'), 'rb') as pyproject:
+    VERSION = tomllib.load(pyproject)['project']['version']
 
 ### VALUES MUST BE LIKE THAT :
 #BUCKET_NAME = 'prod-nehemiebarkia-publique'

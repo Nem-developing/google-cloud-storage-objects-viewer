@@ -21,6 +21,8 @@ which is enough for a bucket where `allUsers` has the `Storage Object Viewer` ro
 
 ## Run
 
+With Docker:
+
 ```bash
 ./run.bash
 ```
@@ -31,6 +33,23 @@ or by hand:
 docker build -t gcs-list .
 docker run --env-file variables.env -p 8080:8080 gcs-list
 ```
+
+Locally with [uv](https://docs.astral.sh/uv/) (installs Python 3.15 and the dependencies on first run; `variables.env` is read by Flask through `python-dotenv`, a dev-only dependency):
+
+```bash
+uv run flask --app app --env-file variables.env run --debug --port 8080
+```
+
+## Dependencies
+
+Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`; the Docker image installs exactly the locked versions.
+
+```bash
+uv add <package>      # add a dependency
+uv lock --upgrade     # upgrade everything to the latest versions
+```
+
+The app version shown in the footer is the `version` field of `pyproject.toml`.
 
 ## URLs
 
