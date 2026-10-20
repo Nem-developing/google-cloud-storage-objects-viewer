@@ -1,116 +1,165 @@
-from flask import Flask, render_template
-from google.cloud import storage
-from flask import request
-import locale
 import os
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
-BUCKET_NAME = os.getenv('BUCKET_NAME')
-FOLDER_SRC = os.getenv('FOLDER_SRC')
-PUB_URL = os.getenv('PUB_URL')
-TITLE = os.getenv('TITLE')
-version = "1.3"
+from flask import Flask, abort, redirect, render_template, url_for
+from google.api_core.exceptions import GoogleAPIError
+from google.auth.exceptions import DefaultCredentialsError
+from google.cloud import storage
+
+VERSION = "2.0"
 
 ### VALUES MUST BE LIKE THAT :
 #BUCKET_NAME = 'prod-nehemiebarkia-publique'
 #FOLDER_SRC = 'scripts/'
 #PUB_URL = 'https://storage.googleapis.com/prod-nehemiebarkia-publique'
 #TITLE = "SCRIPTS RÉDIGÉS PAR BARKIA NEHEMIE"
+#TIMEZONE = 'Europe/Paris'
 ###
+BUCKET_NAME = os.environ['BUCKET_NAME']
+FOLDER_SRC = os.getenv('FOLDER_SRC', '').strip('/')
+FOLDER_SRC = FOLDER_SRC + '/' if FOLDER_SRC else ''
+PUB_URL = os.getenv('PUB_URL', f'https://storage.googleapis.com/{BUCKET_NAME}').rstrip('/')
+TITLE = os.getenv('TITLE', BUCKET_NAME)
+TIMEZONE = ZoneInfo(os.getenv('TIMEZONE', 'Europe/Paris'))
+
+MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet',
+          'août', 'septembre', 'octobre', 'novembre', 'décembre']
+
+FILE_KINDS = {
+    'code': {'sh', 'bash', 'zsh', 'ps1', 'psm1', 'bat', 'cmd', 'py', 'js', 'ts', 'rb', 'pl',
+             'php', 'go', 'rs', 'c', 'cpp', 'h', 'java', 'sql', 'html', 'css', 'json',
+             'yml', 'yaml', 'toml', 'ini', 'conf', 'cfg', 'xml', 'tf'},
+    'archive': {'zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar', 'deb', 'rpm', 'iso'},
+    'image': {'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'bmp'},
+    'doc': {'pdf', 'txt', 'md', 'doc', 'docx', 'odt', 'rtf', 'csv', 'xls', 'xlsx', 'ods'},
+}
 
 
 app = Flask(__name__)
 
 
-def list_blobs_with_prefix(bucket_name, prefix):
-    storage_client = storage.Client()
-    blobs = storage_client.list_blobs(bucket_name, prefix=prefix)
-    return blobs
-
-def is_a_folder(path):
-    if path.endswith("/"):
-        return True
-    else:
-        return False
+def get_storage_client():
+    try:
+        return storage.Client()
+    except DefaultCredentialsError:
+        # No credentials available: a public bucket can still be listed anonymously
+        return storage.Client.create_anonymous_client()
 
 
-def get_split(path):
-    SPLITED = path.rsplit("/")
-    return SPLITED
+storage_client = get_storage_client()
 
-def path_is_a_file(path):
-    if path.endswith('/'):
-        return False
-    else:
-        return True
 
-def define_url(file_name,subpath,is_a_file):
-    URL = ''
-    if is_a_file:
-        URL = PUB_URL + '/' + FOLDER_SRC +  subpath + file_name
-    else:
-        URL = './' + file_name
-    return URL
-    
-def get_blob_name(file_path, is_a_file):
-    name=''
-    if is_a_file:
-        name = file_path.rsplit('/', 1)[-1]
-    else:
-        name = file_path.rsplit('/')[-2] + '/'
-    return name
+def list_folder(prefix):
+    # delimiter='/' makes GCS return sub-folders as "prefixes", even when no
+    # placeholder object "folder/" exists (gsutil cp -r, gcloud storage rsync, SDKs...).
+    # Without it, those folders and everything inside them were invisible.
+    iterator = storage_client.list_blobs(BUCKET_NAME, prefix=prefix, delimiter='/')
+    blobs = list(iterator)
+    return iterator.prefixes, blobs
 
+
+def public_url(blob_name):
+    return PUB_URL + '/' + quote(blob_name)
+
+
+def file_kind(file_name):
+    extension = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else ''
+    for kind, extensions in FILE_KINDS.items():
+        if extension in extensions:
+            return kind
+    return 'file'
+
+
+@app.template_filter('human_size')
 def bytes_to_human_readable(size_bytes):
     suffixes = ['o', 'Ko', 'Mo', 'Go', 'To', 'Po']
     suffix_index = 0
     while size_bytes >= 1024 and suffix_index < len(suffixes) - 1:
         size_bytes /= 1024
         suffix_index += 1
-    return f"{size_bytes:.2f} {suffixes[suffix_index]}"
+    if suffix_index == 0:
+        return f"{size_bytes} {suffixes[0]}"
+    return f"{size_bytes:.1f}".replace('.', ',') + f" {suffixes[suffix_index]}"
+
+
+@app.template_filter('french_date')
+def french_date(date, with_time=True):
+    date = date.astimezone(TIMEZONE)
+    day = f"{date.day} {MONTHS[date.month - 1]} {date.year}"
+    return f"{day}, {date:%H:%M}" if with_time else day
+
+
+@app.context_processor
+def inject_globals():
+    return {'title': TITLE, 'version': VERSION}
 
 
 @app.route('/', defaults={'subpath': ''})
 @app.route('/<path:subpath>')
-def catch_all(subpath):
+def browse(subpath):
+    if subpath and not subpath.endswith('/'):
+        # "/folder/script.sh" -> the public file, "/folder" -> "/folder/"
+        blob_name = FOLDER_SRC + subpath
+        if storage_client.bucket(BUCKET_NAME).blob(blob_name).exists():
+            return redirect(public_url(blob_name))
+        return redirect(url_for('browse', subpath=subpath + '/'))
+
     prefix = FOLDER_SRC + subpath
-    blobs = list_blobs_with_prefix(BUCKET_NAME, prefix)
-    files = []
+    prefixes, blobs = list_folder(prefix)
+    if subpath and not prefixes and not blobs:
+        abort(404)
 
-    for blob in blobs:
-        ###################################################
-        file_path = blob.name[len(FOLDER_SRC):]
-        path_parents = get_split(file_path)
-        deep = file_path.count('/')
-        file_size = bytes_to_human_readable(blob.size)
-        is_a_file = path_is_a_file(file_path)
-        ###################################################
-
-        blob_name = get_blob_name(file_path, is_a_file)
-        url = define_url(blob_name,subpath,is_a_file)
-        #
-        creation_time = blob.time_created.strftime("%A %d %B %Y à %H:%M")
-        last_modified = blob.updated.strftime("%A %d %B %Y à %H:%M")
-        ###################################################
-
-        file_info = {
-            'path': file_path,
-            'name': blob_name,
-            'size': file_size,
-            'path_parents': path_parents,
-            'is_a_file': is_a_file,
-            'deep': deep,
-            'url': url,
-            'creation_time': creation_time,
-            'last_modified': last_modified,
+    folders = [
+        {
+            'name': folder_prefix[len(prefix):].rstrip('/'),
+            'url': url_for('browse', subpath=folder_prefix[len(FOLDER_SRC):]),
         }
-        deep_in_sub = subpath.count('/')
-        if (is_a_file == True):
-            if (deep == deep_in_sub):
-                files.append(file_info)
-        elif (is_a_file == False):
-            if (deep == (deep_in_sub + 1)):
-                files.append(file_info)
+        for folder_prefix in prefixes
+    ]
+    files = [
+        {
+            'name': blob.name[len(prefix):],
+            'url': public_url(blob.name),
+            'kind': file_kind(blob.name),
+            'size': blob.size,
+            'created': blob.time_created,
+            'updated': blob.updated,
+        }
+        # Skip the placeholder object of the current folder itself
+        for blob in blobs if blob.name != prefix
+    ]
+    folders.sort(key=lambda folder: folder['name'].casefold())
+    files.sort(key=lambda file: file['name'].casefold())
 
-    return render_template('index.html', files=files, subpath=subpath, title=TITLE, version=version)
+    parts = subpath.rstrip('/').split('/') if subpath else []
+    breadcrumbs = [
+        {'name': part, 'url': url_for('browse', subpath='/'.join(parts[:index + 1]) + '/')}
+        for index, part in enumerate(parts)
+    ]
+    parent_url = breadcrumbs[-2]['url'] if len(breadcrumbs) > 1 else url_for('browse')
+
+    return render_template(
+        'index.html',
+        bucket_path=f'gs://{BUCKET_NAME}/{prefix}',
+        folders=folders,
+        files=files,
+        total_size=sum(file['size'] for file in files),
+        breadcrumbs=breadcrumbs,
+        parent_url=parent_url if subpath else None,
+    )
+
+
+@app.errorhandler(404)
+def not_found(error):
+    return render_template('error.html', code=404, message="Ce dossier n'existe pas (ou plus)."), 404
+
+
+@app.errorhandler(GoogleAPIError)
+def storage_error(error):
+    app.logger.exception('Google Cloud Storage request failed')
+    return render_template('error.html', code=502, message="Impossible de lire le bucket pour le moment."), 502
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))

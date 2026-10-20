@@ -1,6 +1,6 @@
-cd /home/nehemiebarkia/docker/google-storage-web/
+cd "$(dirname "$0")"
 docker build -t gcs-list .
-docker run --env-file variables.env -p 8080:8080 gcs-list 
+docker run --env-file variables.env -p 8080:8080 gcs-list
  
 
 

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gcs-viewer (docker)",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["run", "--rm", "--name", "gcs-viewer-preview", "--env-file", "variables.env", "-p", "8080:8080", "gcs-list"],
+      "port": 8080
+    }
+  ]
+}

@@ -1,124 +1,181 @@
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <title>{{title}}</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            line-height: 1.6;
-            background-color: #f0f0f0;
-            margin: 20px;
-            display: flex;
-            flex-direction: column;
-            min-height: 100vh;
-        }
+{% extends "base.html" %}
 
-        h1 {
-            text-align: center;
-            margin-bottom: 20px;
-        }
+{% block title %}{% if breadcrumbs %}{{ breadcrumbs[-1].name }} · {% endif %}{{ title }}{% endblock %}
 
-        table {
-            width: 80%;
-            border-collapse: collapse;
-            margin: 0 auto;
-            background-color: #fff;
-            box-shadow: 0 0 20px rgba(0, 0, 0, 0.1);
-        }
+{% block meta %}
+<span class="path" title="Emplacement dans le bucket">{{ bucket_path }}</span>
+<span>
+    {%- if folders %}{{ folders|length }} dossier{{ 's' if folders|length > 1 }}{% endif %}
+    {%- if folders and files %} · {% endif %}
+    {%- if files %}{{ files|length }} fichier{{ 's' if files|length > 1 }} · {{ total_size|human_size }}{% endif %}
+    {%- if not folders and not files %}Dossier vide{% endif -%}
+</span>
+{% endblock %}
 
-        th, td {
-            border: 1px solid #ddd;
-            padding: 10px;
-            text-align: left;
-        }
+{% block content %}
+<div class="panel">
+    <div class="toolbar">
+        <nav class="crumbs" aria-label="Fil d'Ariane">
+            <a class="home" href="{{ url_for('browse') }}" title="Racine"{% if not breadcrumbs %} aria-current="page"{% endif %}>
+                <svg class="i"><use href="#i-home"/></svg><span class="sr-only">Racine</span>
+            </a>
+            {% for crumb in breadcrumbs %}
+            <span class="sep" aria-hidden="true">/</span>
+            {% if loop.last %}
+            <span aria-current="page">{{ crumb.name }}</span>
+            {% else %}
+            <a href="{{ crumb.url }}">{{ crumb.name }}</a>
+            {% endif %}
+            {% endfor %}
+        </nav>
+        {% if folders or files %}
+        <label class="search">
+            <span class="sr-only">Filtrer les éléments</span>
+            <svg class="i"><use href="#i-search"/></svg>
+            <input id="filter" type="search" placeholder="Filtrer…" autocomplete="off" spellcheck="false">
+            <kbd>/</kbd>
+        </label>
+        {% endif %}
+    </div>
 
-        th {
-            background-color: #f2f2f2;
-            color: #333;
-            font-weight: bold;
-        }
-
-        tr:nth-child(even) {
-            background-color: #f9f9f9;
-        }
-
-        tr:hover {
-            background-color: #f5f5f5;
-        }
-
-        #footer {
-            display: flex;
-            justify-content: space-between;
-            width: 80%;
-            margin: 20px auto 0 auto;
-        }
-
-        #footer .info {
-            background-color: #fff;
-            padding: 10px;
-            border: 1px solid #ddd;
-            box-shadow: 0 0 20px rgba(0, 0, 0, 0.1);
-            width: 45%;
-            text-align: center;
-        }
-
-        .back-button {
-            text-align: center;
-            background-color: #4CAF50;
-            color: white;
-            padding: 10px;
-            text-decoration: none;
-            margin-bottom: 10px;
-            margin-left: 10%;
-            margin-right: 10%;          
-            {% if subpath == '' %}color: #4CAF50;{% endif %}
-        }
-
-        .back-button:hover {
-            background-color: #45a049;
-            {% if subpath == '' %}color: #45a049;{% endif %}
-        }
-    </style>
-</head>
-<body>
-    <h1>{{title}}</h1>
-    <a class="back-button" href="../">Go to Parent Directory</a>
     <table>
         <thead>
             <tr>
-                <th>Object</th>
-                <th>Size (Octet)</th>
-                <th>Creation</th>
-                <th>Last Update</th>
+                <th data-sort="name" aria-sort="ascending"><button type="button">Nom <svg class="i sort-icon"><use href="#i-chevron"/></svg></button></th>
+                <th data-sort="size" class="num"><button type="button">Taille <svg class="i sort-icon"><use href="#i-chevron"/></svg></button></th>
+                <th data-sort="created" class="col-created"><button type="button">Créé le <svg class="i sort-icon"><use href="#i-chevron"/></svg></button></th>
+                <th data-sort="updated" class="col-updated"><button type="button">Modifié le <svg class="i sort-icon"><use href="#i-chevron"/></svg></button></th>
+                <th class="actions"><span class="sr-only">Actions</span></th>
             </tr>
         </thead>
-        <tbody>
-            {% for file in files %}
+        {% if parent_url %}
+        <tbody class="up">
             <tr>
-                {% if file.name != '' %}
-                <td><a href="{{ file.url }}">{{ file.name }}</a></td>
-                <td>{{ file.size }}</td>
-                <td>{{ file.creation_time }}</td>
-                <td>{{ file.last_modified }}</td>
-                {% else %}
-                <td></td>
-                <td></td>
-                <td></td>
-                <td></td>
-                {% endif %}
+                <td colspan="5">
+                    <a class="entry" href="{{ parent_url }}">
+                        <span class="icon k-up"><svg class="i"><use href="#i-up"/></svg></span>
+                        <span class="label">Dossier parent</span>
+                    </a>
+                </td>
+            </tr>
+        </tbody>
+        {% endif %}
+        <tbody id="entries">
+            {% for folder in folders %}
+            <tr data-type="0" data-name="{{ folder.name }}">
+                <td>
+                    <a class="entry is-folder" href="{{ folder.url }}">
+                        <span class="icon k-folder"><svg class="i"><use href="#i-folder"/></svg></span>
+                        <span class="text"><span class="label">{{ folder.name }}</span></span>
+                    </a>
+                </td>
+                <td class="num dim">—</td>
+                <td class="date dim col-created">—</td>
+                <td class="date dim col-updated">—</td>
+                <td class="actions"></td>
             </tr>
             {% endfor %}
+            {% for file in files %}
+            <tr data-type="1" data-name="{{ file.name }}" data-size="{{ file.size }}" data-created="{{ file.created.isoformat() }}" data-updated="{{ file.updated.isoformat() }}">
+                <td>
+                    <a class="entry" href="{{ file.url }}">
+                        <span class="icon k-{{ file.kind }}"><svg class="i"><use href="#i-{{ file.kind }}"/></svg></span>
+                        <span class="text">
+                            <span class="label">{{ file.name }}</span>
+                            <span class="mobile-meta">Modifié le {{ file.updated|french_date(with_time=False) }}</span>
+                        </span>
+                    </a>
+                </td>
+                <td class="num">{{ file.size|human_size }}</td>
+                <td class="date col-created"><time datetime="{{ file.created.isoformat() }}">{{ file.created|french_date }}</time></td>
+                <td class="date col-updated"><time datetime="{{ file.updated.isoformat() }}">{{ file.updated|french_date }}</time></td>
+                <td class="actions">
+                    <button type="button" class="copy" data-copy="{{ file.url }}" title="Copier le lien public" aria-label="Copier le lien public de {{ file.name }}">
+                        <svg class="i i-copy"><use href="#i-copy"/></svg><svg class="i i-check"><use href="#i-check"/></svg>
+                    </button>
+                </td>
+            </tr>
+            {% endfor %}
+            {% if not folders and not files %}
+            <tr class="empty"><td colspan="5">Ce dossier est vide.</td></tr>
+            {% endif %}
+            <tr class="empty" id="no-match" hidden><td colspan="5">Aucun élément ne correspond à « <span id="query"></span> ».</td></tr>
         </tbody>
     </table>
+</div>
+{% endblock %}
 
-    <div id="footer">
-        <div class="info">
-            <a href="https://github.com/Nem-developing/google-cloud-storage-objects-viewer">Version : {{version}}</a>
-        </div>
-        <div class="info">
-            Google Cloud Storage Objects Viewer Made By <a href="https://nehemiebarkia.fr">BARKIA Néhémie</a>
-        </div>
-    </div>
-</body>
-</html>
+{% block scripts %}
+<script>
+    (() => {
+        const tbody = document.getElementById('entries');
+        const rows = [...tbody.querySelectorAll('tr[data-name]')];
+        const noMatch = document.getElementById('no-match');
+        const filter = document.getElementById('filter');
+        const collator = new Intl.Collator('fr', { numeric: true, sensitivity: 'base' });
+
+        // Filter
+        if (filter) {
+            filter.addEventListener('input', () => {
+                const query = filter.value.trim().toLocaleLowerCase('fr');
+                let visible = 0;
+                for (const row of rows) {
+                    row.hidden = !row.dataset.name.toLocaleLowerCase('fr').includes(query);
+                    visible += !row.hidden;
+                }
+                document.getElementById('query').textContent = filter.value.trim();
+                noMatch.hidden = visible > 0;
+            });
+
+            document.addEventListener('keydown', (event) => {
+                if (event.key === '/' && document.activeElement !== filter) {
+                    event.preventDefault();
+                    filter.focus();
+                } else if (event.key === 'Escape' && document.activeElement === filter) {
+                    filter.value = '';
+                    filter.dispatchEvent(new Event('input'));
+                    filter.blur();
+                }
+            });
+        }
+
+        // Sort (folders always stay on top)
+        const headers = [...document.querySelectorAll('th[data-sort]')];
+        let sort = { key: 'name', direction: 1 };
+
+        const compare = (a, b) => {
+            const x = a.dataset[sort.key] || '';
+            const y = b.dataset[sort.key] || '';
+            if (sort.key === 'name') return collator.compare(x, y);
+            if (sort.key === 'size') return Number(x) - Number(y);
+            return x < y ? -1 : x > y ? 1 : 0;
+        };
+
+        for (const header of headers) {
+            header.querySelector('button').addEventListener('click', () => {
+                const key = header.dataset.sort;
+                sort = { key, direction: sort.key === key ? -sort.direction : (key === 'name' ? 1 : -1) };
+                rows.sort((a, b) => (a.dataset.type - b.dataset.type)
+                    || compare(a, b) * sort.direction
+                    || collator.compare(a.dataset.name, b.dataset.name));
+                tbody.append(...rows, noMatch);
+                for (const other of headers) other.removeAttribute('aria-sort');
+                header.setAttribute('aria-sort', sort.direction > 0 ? 'ascending' : 'descending');
+            });
+        }
+
+        // Copy public link
+        tbody.addEventListener('click', async (event) => {
+            const button = event.target.closest('[data-copy]');
+            if (!button) return;
+            try {
+                await navigator.clipboard.writeText(button.dataset.copy);
+                button.classList.add('copied');
+                setTimeout(() => button.classList.remove('copied'), 1500);
+            } catch {
+                window.prompt('Lien public :', button.dataset.copy);
+            }
+        });
+    })();
+</script>
+{% endblock %}

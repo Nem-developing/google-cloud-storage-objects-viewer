@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+
+{% block title %}Erreur {{ code }} · {{ title }}{% endblock %}
+
+{% block content %}
+<div class="panel error">
+    <p class="code">{{ code }}</p>
+    <p>{{ message }}</p>
+    <a class="button" href="{{ url_for('browse') }}"><svg class="i"><use href="#i-home"/></svg>Retour à la racine</a>
+</div>
+{% endblock %}

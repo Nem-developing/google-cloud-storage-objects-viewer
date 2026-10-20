@@ -1,2 +1,4 @@
-Flask
-google-cloud-storage
+Flask>=3.0,<4
+google-cloud-storage>=2.14,<4
+gunicorn>=22
+tzdata
