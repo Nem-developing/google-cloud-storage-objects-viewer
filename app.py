@@ -1,13 +1,16 @@
+import gzip
 import os
+import threading
+import time
 import tomllib
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
-from flask import Flask, abort, redirect, render_template, url_for
-from google.api_core.exceptions import GoogleAPIError
-from google.auth.exceptions import DefaultCredentialsError
+from flask import Flask, abort, redirect, render_template, request, url_for
+from google.api_core.exceptions import Forbidden, Unauthorized
 from google.cloud import storage
+from google.cloud.storage.retry import DEFAULT_RETRY
 
 with open(Path(__file__).with_name('pyproject.toml'), 'rb') as pyproject:
     VERSION = tomllib.load(pyproject)['project']['version']
@@ -18,13 +21,26 @@ with open(Path(__file__).with_name('pyproject.toml'), 'rb') as pyproject:
 #PUB_URL = 'https://storage.googleapis.com/prod-nehemiebarkia-publique'
 #TITLE = "SCRIPTS RÉDIGÉS PAR BARKIA NEHEMIE"
 #TIMEZONE = 'Europe/Paris'
+#CACHE_TTL = 30
 ###
 BUCKET_NAME = os.environ['BUCKET_NAME']
 FOLDER_SRC = os.getenv('FOLDER_SRC', '').strip('/')
 FOLDER_SRC = FOLDER_SRC + '/' if FOLDER_SRC else ''
 PUB_URL = os.getenv('PUB_URL', f'https://storage.googleapis.com/{BUCKET_NAME}').rstrip('/')
+PUB_ORIGIN = '{0.scheme}://{0.netloc}'.format(urlsplit(PUB_URL))
 TITLE = os.getenv('TITLE', BUCKET_NAME)
 TIMEZONE = ZoneInfo(os.getenv('TIMEZONE', 'Europe/Paris'))
+CACHE_TTL = float(os.getenv('CACHE_TTL', '30'))
+
+# Only the fields the page displays: lighter responses, faster listing
+LIST_FIELDS = 'items(name,size,timeCreated,updated),nextPageToken'
+LIST_TIMEOUT = 10
+# The default policy keeps retrying for 120 s: a GCS hiccup used to freeze pages for 2 minutes
+LIST_RETRY = DEFAULT_RETRY.with_timeout(15)
+# After a failed reload, keep serving the previous copy this long before trying again
+RETRY_DELAY = 10
+# Unknown path: reload if the copy is older than this, the object may have just been uploaded
+MISS_MAX_AGE = 5
 
 MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet',
           'août', 'septembre', 'octobre', 'novembre', 'décembre']
@@ -42,26 +58,6 @@ FILE_KINDS = {
 app = Flask(__name__)
 
 
-def get_storage_client():
-    try:
-        return storage.Client()
-    except DefaultCredentialsError:
-        # No credentials available: a public bucket can still be listed anonymously
-        return storage.Client.create_anonymous_client()
-
-
-storage_client = get_storage_client()
-
-
-def list_folder(prefix):
-    # delimiter='/' makes GCS return sub-folders as "prefixes", even when no
-    # placeholder object "folder/" exists (gsutil cp -r, gcloud storage rsync, SDKs...).
-    # Without it, those folders and everything inside them were invisible.
-    iterator = storage_client.list_blobs(BUCKET_NAME, prefix=prefix, delimiter='/')
-    blobs = list(iterator)
-    return iterator.prefixes, blobs
-
-
 def public_url(blob_name):
     return PUB_URL + '/' + quote(blob_name)
 
@@ -72,6 +68,126 @@ def file_kind(file_name):
         if extension in extensions:
             return kind
     return 'file'
+
+
+class BucketUnavailable(Exception):
+    pass
+
+
+class Snapshot:
+    """Copy of the FOLDER_SRC tree: {folder path: folder} and {file path: file}."""
+
+    def __init__(self, folders, files):
+        self.folders = folders
+        self.files = files
+        self.loaded_at = time.monotonic()
+
+    @property
+    def age(self):
+        return time.monotonic() - self.loaded_at
+
+
+def new_folder(name, path):
+    return {'name': name, 'path': path, 'folders': [], 'files': [], 'size': 0, 'count': 0, 'updated': None}
+
+
+def build_snapshot(blobs):
+    root = new_folder('', '')
+    folders = {'': root}
+    files = {}
+
+    for blob in blobs:
+        path = blob.name[len(FOLDER_SRC):]
+        # Folders come from the object paths, so they exist with or without a
+        # placeholder object "folder/" (gsutil cp -r, gcloud storage rsync, SDKs...)
+        ancestors = [root]
+        for name in path.split('/')[:-1]:
+            folder_path = ancestors[-1]['path'] + name + '/'
+            if folder_path not in folders:
+                folders[folder_path] = new_folder(name, folder_path)
+                ancestors[-1]['folders'].append(folders[folder_path])
+            ancestors.append(folders[folder_path])
+
+        if not path or path.endswith('/'):
+            continue  # placeholder object of a folder, not a file
+
+        file = {
+            'name': path.rsplit('/', 1)[-1],
+            'path': path,
+            'url': public_url(blob.name),
+            'kind': file_kind(path),
+            'size': blob.size or 0,
+            'created': blob.time_created,
+            'updated': blob.updated,
+        }
+        ancestors[-1]['files'].append(file)
+        files[path] = file
+        for folder in ancestors:
+            folder['size'] += file['size']
+            folder['count'] += 1
+            if folder['updated'] is None or file['updated'] > folder['updated']:
+                folder['updated'] = file['updated']
+
+    for folder in folders.values():
+        folder['folders'].sort(key=lambda child: child['name'].casefold())
+        folder['files'].sort(key=lambda child: child['name'].casefold())
+    return Snapshot(folders, files)
+
+
+class BucketIndex:
+    """In-memory copy of the bucket, so browsing never waits for GCS.
+
+    The whole FOLDER_SRC tree is listed in one go (one request per 1000 objects)
+    and reloaded when older than CACHE_TTL. While a reload runs, or when GCS is
+    unreachable, the previous copy keeps being served.
+    """
+
+    def __init__(self, ttl, client=None):
+        self.ttl = ttl
+        # Public bucket: no credentials needed. Looking for them takes ~12 s outside Google Cloud.
+        self.client = client or storage.Client.create_anonymous_client()
+        self.anonymous = True
+        self.snapshot = None
+        self.retry_at = 0
+        self.lock = threading.Lock()
+
+    def get(self, max_age=None):
+        snapshot = self.snapshot
+        if snapshot is None or snapshot.age >= (self.ttl if max_age is None else max_age):
+            self.reload(snapshot)
+            snapshot = self.snapshot
+        if snapshot is None:
+            raise BucketUnavailable
+        return snapshot
+
+    def reload(self, seen):
+        # Without any copy, wait for the running reload; otherwise keep serving the current copy
+        if not self.lock.acquire(blocking=seen is None):
+            return
+        try:
+            if self.snapshot is not seen or time.monotonic() < self.retry_at:
+                return  # reloaded by another request meanwhile, or failed a moment ago
+            self.snapshot = build_snapshot(self.list_objects())
+        except Exception:
+            app.logger.exception('Listing gs://%s/%s failed', BUCKET_NAME, FOLDER_SRC)
+            self.retry_at = time.monotonic() + RETRY_DELAY
+        finally:
+            self.lock.release()
+
+    def list_objects(self):
+        try:
+            return list(self.client.list_blobs(BUCKET_NAME, prefix=FOLDER_SRC, fields=LIST_FIELDS,
+                                               timeout=LIST_TIMEOUT, retry=LIST_RETRY))
+        except (Unauthorized, Forbidden):
+            if not self.anonymous:
+                raise
+            # The listing is not public: use the default credentials (service account...)
+            app.logger.warning('Anonymous listing refused, using the default Google credentials')
+            self.client, self.anonymous = storage.Client(), False
+            return self.list_objects()
+
+
+bucket_index = BucketIndex(CACHE_TTL)
 
 
 @app.template_filter('human_size')
@@ -95,45 +211,29 @@ def french_date(date, with_time=True):
 
 @app.context_processor
 def inject_globals():
-    return {'title': TITLE, 'version': VERSION}
+    return {'title': TITLE, 'version': VERSION, 'pub_origin': PUB_ORIGIN}
+
+
+def find(snapshot, subpath):
+    if not subpath or subpath.endswith('/'):
+        return snapshot.folders.get(subpath)
+    return snapshot.files.get(subpath) or snapshot.folders.get(subpath + '/')
 
 
 @app.route('/', defaults={'subpath': ''})
 @app.route('/<path:subpath>')
 def browse(subpath):
-    if subpath and not subpath.endswith('/'):
-        # "/folder/script.sh" -> the public file, "/folder" -> "/folder/"
-        blob_name = FOLDER_SRC + subpath
-        if storage_client.bucket(BUCKET_NAME).blob(blob_name).exists():
-            return redirect(public_url(blob_name))
-        return redirect(url_for('browse', subpath=subpath + '/'))
-
-    prefix = FOLDER_SRC + subpath
-    prefixes, blobs = list_folder(prefix)
-    if subpath and not prefixes and not blobs:
+    entry = find(bucket_index.get(), subpath)
+    if entry is None:
+        entry = find(bucket_index.get(max_age=MISS_MAX_AGE), subpath)
+    if entry is None:
         abort(404)
-
-    folders = [
-        {
-            'name': folder_prefix[len(prefix):].rstrip('/'),
-            'url': url_for('browse', subpath=folder_prefix[len(FOLDER_SRC):]),
-        }
-        for folder_prefix in prefixes
-    ]
-    files = [
-        {
-            'name': blob.name[len(prefix):],
-            'url': public_url(blob.name),
-            'kind': file_kind(blob.name),
-            'size': blob.size,
-            'created': blob.time_created,
-            'updated': blob.updated,
-        }
-        # Skip the placeholder object of the current folder itself
-        for blob in blobs if blob.name != prefix
-    ]
-    folders.sort(key=lambda folder: folder['name'].casefold())
-    files.sort(key=lambda file: file['name'].casefold())
+    if 'folders' not in entry:
+        # "/folder/script.sh" -> the public file
+        return redirect(entry['url'])
+    if entry['path'] != subpath:
+        # "/folder" -> "/folder/"
+        return redirect(url_for('browse', subpath=entry['path']))
 
     parts = subpath.rstrip('/').split('/') if subpath else []
     breadcrumbs = [
@@ -144,13 +244,31 @@ def browse(subpath):
 
     return render_template(
         'index.html',
-        bucket_path=f'gs://{BUCKET_NAME}/{prefix}',
-        folders=folders,
-        files=files,
-        total_size=sum(file['size'] for file in files),
+        bucket_path=f'gs://{BUCKET_NAME}/{FOLDER_SRC}{subpath}',
+        folders=entry['folders'],
+        files=entry['files'],
+        total_size=entry['size'],
         breadcrumbs=breadcrumbs,
         parent_url=parent_url if subpath else None,
     )
+
+
+@app.route('/healthz')
+def healthz():
+    # Loads the copy the first time but never reloads it: monitoring costs no GCS requests
+    snapshot = bucket_index.snapshot or bucket_index.get()
+    return {'status': 'ok', 'objects': len(snapshot.files), 'age': round(snapshot.age)}
+
+
+@app.after_request
+def compress(response):
+    # Pages are ~25 Ko of HTML (inline styles and icons): gzip divides that by ~5
+    if (response.status_code == 200 and response.mimetype == 'text/html'
+            and 'gzip' in request.accept_encodings and not response.direct_passthrough):
+        response.set_data(gzip.compress(response.get_data(), compresslevel=6))
+        response.headers['Content-Encoding'] = 'gzip'
+        response.vary.add('Accept-Encoding')
+    return response
 
 
 @app.errorhandler(404)
@@ -158,9 +276,8 @@ def not_found(error):
     return render_template('error.html', code=404, message="Ce dossier n'existe pas (ou plus)."), 404
 
 
-@app.errorhandler(GoogleAPIError)
-def storage_error(error):
-    app.logger.exception('Google Cloud Storage request failed')
+@app.errorhandler(BucketUnavailable)
+def bucket_unavailable(error):
     return render_template('error.html', code=502, message="Impossible de lire le bucket pour le moment."), 502
 
 

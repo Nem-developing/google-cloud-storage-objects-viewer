@@ -13,18 +13,23 @@ breadcrumbs, folders first, sortable columns, instant filter (`/`), copy-link bu
 | `PUB_URL`     | no       | `https://storage.googleapis.com/prod-nehemiebarkia-publique` | `https://storage.googleapis.com/BUCKET_NAME` |
 | `TITLE`       | no       | `SCRIPTS RÉDIGÉS PAR BARKIA NEHEMIE`                         | `BUCKET_NAME`                                |
 | `TIMEZONE`    | no       | `Europe/Paris`                                               | `Europe/Paris`                               |
+| `CACHE_TTL`   | no       | `30`                                                         | `30` (seconds)                               |
 | `PORT`        | no       | `8080`                                                       | `8080`                                       |
 
-Credentials: the app uses the default Google credentials when available (GCE / Cloud Run service account,
-`gcloud auth application-default login`...). Without any credentials it falls back to an anonymous client,
-which is enough for a bucket where `allUsers` has the `Storage Object Viewer` role.
+Credentials: the bucket is read anonymously, which works when `allUsers` has the `Storage Object Viewer` role.
+If the anonymous listing is refused, the app switches to the default Google credentials
+(GCE / Cloud Run service account, `gcloud auth application-default login`...).
 
 ## Run
 
-With Docker:
+With Docker (rebuilds the image and replaces the running container, restarted automatically after a crash or a reboot):
 
 ```bash
 ./run.bash
+```
+
+```bash
+docker logs -f gcs-list
 ```
 
 or by hand:
@@ -51,15 +56,33 @@ uv lock --upgrade     # upgrade everything to the latest versions
 
 The app version shown in the footer is the `version` field of `pyproject.toml`.
 
+Tests:
+
+```bash
+uv run pytest
+```
+
 ## URLs
 
 - `/BASH/INSTALLATIONS/` lists a folder.
 - `/BASH/INSTALLATIONS/LAMP.sh` redirects to the public URL of the file, handy for
   `curl -sL https://your-site/BASH/INSTALLATIONS/LAMP.sh | bash`.
+- `/healthz` returns `{"status": "ok", "objects": …, "age": …}` for monitoring (502 if the bucket can't be read).
+
+## Speed & reliability
+
+- The whole `FOLDER_SRC` tree is kept in memory (one GCS request per 1000 objects): browsing never waits for GCS.
+  It is reloaded when older than `CACHE_TTL`, and right away when a path is unknown (just uploaded),
+  at most once every 5 seconds.
+- If GCS is unreachable, the last good copy keeps being served; requests to GCS time out after 10–15 s.
+- No credential lookup by default: outside Google Cloud it took ~12 s at startup.
+- Pages are gzipped, and Chrome / Edge prefetch a folder when its link is hovered.
+
+Meant for buckets up to a few tens of thousands of objects under `FOLDER_SRC`.
 
 ## Folders without placeholder objects
 
 GCS has no real folders. Before v2.0 a folder only showed up if an empty `folder/` object existed, which the console
 creates with "Create folder" but most tools (`gsutil cp -r`, `gcloud storage cp -r`, `rsync`, SDKs...) do not.
 Those folders (and everything inside them) were invisible until deleted and re-uploaded.
-Since v2.0 the listing uses the `/` delimiter, so every folder is displayed however it was uploaded.
+Since v2.0 folders are derived from the object paths, so every folder is displayed however it was uploaded.
