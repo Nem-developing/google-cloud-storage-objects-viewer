@@ -1,6 +1,6 @@
 [project]
 name = "google-cloud-storage-objects-viewer"
-version = "2.2"
+version = "2.3"
 description = "Easy Way To Dispay The Content Of PUBLIC Google Cloud Storage Bucket"
 readme = "README.md"
 requires-python = ">=3.12"

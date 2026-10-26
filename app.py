@@ -21,7 +21,7 @@ with open(Path(__file__).with_name('pyproject.toml'), 'rb') as pyproject:
 #PUB_URL = 'https://storage.googleapis.com/prod-nehemiebarkia-publique'
 #TITLE = "SCRIPTS RÉDIGÉS PAR BARKIA NEHEMIE"
 #TIMEZONE = 'Europe/Paris'
-#CACHE_TTL = 30
+#CACHE_TTL = 60
 ###
 BUCKET_NAME = os.environ['BUCKET_NAME']
 FOLDER_SRC = os.getenv('FOLDER_SRC', '').strip('/')
@@ -30,17 +30,19 @@ PUB_URL = os.getenv('PUB_URL', f'https://storage.googleapis.com/{BUCKET_NAME}').
 PUB_ORIGIN = '{0.scheme}://{0.netloc}'.format(urlsplit(PUB_URL))
 TITLE = os.getenv('TITLE', BUCKET_NAME)
 TIMEZONE = ZoneInfo(os.getenv('TIMEZONE', 'Europe/Paris'))
-CACHE_TTL = float(os.getenv('CACHE_TTL', '30'))
+CACHE_TTL = float(os.getenv('CACHE_TTL', '60'))
 
 # Only the fields the page displays: lighter responses, faster listing
-LIST_FIELDS = 'items(name,size,timeCreated,updated),nextPageToken'
+LIST_FIELDS = 'items(name,size,timeCreated,updated),prefixes,nextPageToken'
 LIST_TIMEOUT = 10
 # The default policy keeps retrying for 120 s: a GCS hiccup used to freeze pages for 2 minutes
 LIST_RETRY = DEFAULT_RETRY.with_timeout(15)
-# After a failed reload, keep serving the previous copy this long before trying again
+# After a failed listing, serve the previous ones this long before asking GCS again
 RETRY_DELAY = 10
-# Unknown path: reload if the copy is older than this, the object may have just been uploaded
+# Unknown path: list again if the cached listing is older than this, it may have just been uploaded
 MISS_MAX_AGE = 5
+# Folder listings kept in memory (any URL creates one, even a wrong one)
+MAX_CACHED_FOLDERS = 1000
 
 MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet',
           'août', 'septembre', 'octobre', 'novembre', 'décembre']
@@ -74,12 +76,13 @@ class BucketUnavailable(Exception):
     pass
 
 
-class Snapshot:
-    """Copy of the FOLDER_SRC tree: {folder path: folder} and {file path: file}."""
+class Listing:
+    """Content of one folder: its sub-folders and files."""
 
-    def __init__(self, folders, files):
+    def __init__(self, folders, files, exists):
         self.folders = folders
         self.files = files
+        self.exists = exists
         self.loaded_at = time.monotonic()
 
     @property
@@ -87,59 +90,12 @@ class Snapshot:
         return time.monotonic() - self.loaded_at
 
 
-def new_folder(name, path):
-    return {'name': name, 'path': path, 'folders': [], 'files': [], 'size': 0, 'count': 0, 'updated': None}
+class FolderCache:
+    """Listing of each visited folder, kept CACHE_TTL seconds.
 
-
-def build_snapshot(blobs):
-    root = new_folder('', '')
-    folders = {'': root}
-    files = {}
-
-    for blob in blobs:
-        path = blob.name[len(FOLDER_SRC):]
-        # Folders come from the object paths, so they exist with or without a
-        # placeholder object "folder/" (gsutil cp -r, gcloud storage rsync, SDKs...)
-        ancestors = [root]
-        for name in path.split('/')[:-1]:
-            folder_path = ancestors[-1]['path'] + name + '/'
-            if folder_path not in folders:
-                folders[folder_path] = new_folder(name, folder_path)
-                ancestors[-1]['folders'].append(folders[folder_path])
-            ancestors.append(folders[folder_path])
-
-        if not path or path.endswith('/'):
-            continue  # placeholder object of a folder, not a file
-
-        file = {
-            'name': path.rsplit('/', 1)[-1],
-            'path': path,
-            'url': public_url(blob.name),
-            'kind': file_kind(path),
-            'size': blob.size or 0,
-            'created': blob.time_created,
-            'updated': blob.updated,
-        }
-        ancestors[-1]['files'].append(file)
-        files[path] = file
-        for folder in ancestors:
-            folder['size'] += file['size']
-            folder['count'] += 1
-            if folder['updated'] is None or file['updated'] > folder['updated']:
-                folder['updated'] = file['updated']
-
-    for folder in folders.values():
-        folder['folders'].sort(key=lambda child: child['name'].casefold())
-        folder['files'].sort(key=lambda child: child['name'].casefold())
-    return Snapshot(folders, files)
-
-
-class BucketIndex:
-    """In-memory copy of the bucket, so browsing never waits for GCS.
-
-    The whole FOLDER_SRC tree is listed in one go (one request per 1000 objects)
-    and reloaded when older than CACHE_TTL. While a reload runs, or when GCS is
-    unreachable, the previous copy keeps being served.
+    Only the displayed folder is listed (delimiter '/'), never the whole bucket.
+    While a listing is refreshed, or when GCS is unreachable, the previous one
+    keeps being served.
     """
 
     def __init__(self, ttl, client=None):
@@ -147,47 +103,83 @@ class BucketIndex:
         # Public bucket: no credentials needed. Looking for them takes ~12 s outside Google Cloud.
         self.client = client or storage.Client.create_anonymous_client()
         self.anonymous = True
-        self.snapshot = None
+        self.listings = {}
+        self.locks = {}
+        self.mutex = threading.Lock()
         self.retry_at = 0
-        self.lock = threading.Lock()
 
-    def get(self, max_age=None):
-        snapshot = self.snapshot
-        if snapshot is None or snapshot.age >= (self.ttl if max_age is None else max_age):
-            self.reload(snapshot)
-            snapshot = self.snapshot
-        if snapshot is None:
+    def get(self, path, max_age=None):
+        listing = self.listings.get(path)
+        if listing is None or listing.age >= (self.ttl if max_age is None else max_age):
+            self.reload(path, listing)
+            listing = self.listings.get(path)
+        if listing is None:
             raise BucketUnavailable
-        return snapshot
+        return listing
 
-    def reload(self, seen):
-        # Without any copy, wait for the running reload; otherwise keep serving the current copy
-        if not self.lock.acquire(blocking=seen is None):
+    def reload(self, path, seen):
+        with self.mutex:
+            lock = self.locks.setdefault(path, threading.Lock())
+        # Never listed: wait for the running listing; otherwise keep serving the current one
+        if not lock.acquire(blocking=seen is None):
             return
         try:
-            if self.snapshot is not seen or time.monotonic() < self.retry_at:
-                return  # reloaded by another request meanwhile, or failed a moment ago
-            self.snapshot = build_snapshot(self.list_objects())
+            if self.listings.get(path) is not seen or time.monotonic() < self.retry_at:
+                return  # listed by another request meanwhile, or GCS failed a moment ago
+            listing = self.list_folder(path)
+            with self.mutex:
+                if len(self.listings) >= MAX_CACHED_FOLDERS:
+                    self.forget_oldest()
+                self.listings[path] = listing
         except Exception:
-            app.logger.exception('Listing gs://%s/%s failed', BUCKET_NAME, FOLDER_SRC)
+            app.logger.exception('Listing gs://%s/%s%s failed', BUCKET_NAME, FOLDER_SRC, path)
             self.retry_at = time.monotonic() + RETRY_DELAY
         finally:
-            self.lock.release()
+            lock.release()
 
-    def list_objects(self):
+    def forget_oldest(self):
+        for path in sorted(self.listings, key=lambda path: self.listings[path].loaded_at)[:MAX_CACHED_FOLDERS // 2]:
+            del self.listings[path]
+            self.locks.pop(path, None)
+
+    def list_folder(self, path):
+        prefix = FOLDER_SRC + path
         try:
-            return list(self.client.list_blobs(BUCKET_NAME, prefix=FOLDER_SRC, fields=LIST_FIELDS,
-                                               timeout=LIST_TIMEOUT, retry=LIST_RETRY))
+            # delimiter='/' returns the sub-folders as "prefixes", even when no
+            # placeholder object "folder/" exists (gsutil cp -r, gcloud storage rsync, SDKs...)
+            iterator = self.client.list_blobs(BUCKET_NAME, prefix=prefix, delimiter='/', fields=LIST_FIELDS,
+                                              timeout=LIST_TIMEOUT, retry=LIST_RETRY)
+            blobs = list(iterator)
         except (Unauthorized, Forbidden):
             if not self.anonymous:
                 raise
             # The listing is not public: use the default credentials (service account...)
             app.logger.warning('Anonymous listing refused, using the default Google credentials')
             self.client, self.anonymous = storage.Client(), False
-            return self.list_objects()
+            return self.list_folder(path)
+
+        folders = [
+            {'name': folder_prefix[len(prefix):].rstrip('/'), 'path': folder_prefix[len(FOLDER_SRC):]}
+            for folder_prefix in iterator.prefixes
+        ]
+        files = [
+            {
+                'name': blob.name[len(prefix):],
+                'url': public_url(blob.name),
+                'kind': file_kind(blob.name),
+                'size': blob.size or 0,
+                'created': blob.time_created,
+                'updated': blob.updated,
+            }
+            # Skip the placeholder object of the folder itself
+            for blob in blobs if blob.name != prefix
+        ]
+        folders.sort(key=lambda folder: folder['name'].casefold())
+        files.sort(key=lambda file: file['name'].casefold())
+        return Listing(folders, files, exists=bool(blobs or folders))
 
 
-bucket_index = BucketIndex(CACHE_TTL)
+folder_cache = FolderCache(CACHE_TTL)
 
 
 @app.template_filter('human_size')
@@ -214,26 +206,35 @@ def inject_globals():
     return {'title': TITLE, 'version': VERSION, 'pub_origin': PUB_ORIGIN}
 
 
-def find(snapshot, subpath):
-    if not subpath or subpath.endswith('/'):
-        return snapshot.folders.get(subpath)
-    return snapshot.files.get(subpath) or snapshot.folders.get(subpath + '/')
+def find(listing, name):
+    for file in listing.files:
+        if file['name'] == name:
+            return file['url']
+    for folder in listing.folders:
+        if folder['name'] == name:
+            return url_for('browse', subpath=folder['path'])
+    return None
 
 
 @app.route('/', defaults={'subpath': ''})
 @app.route('/<path:subpath>')
 def browse(subpath):
-    entry = find(bucket_index.get(), subpath)
-    if entry is None:
-        entry = find(bucket_index.get(max_age=MISS_MAX_AGE), subpath)
-    if entry is None:
-        abort(404)
-    if 'folders' not in entry:
-        # "/folder/script.sh" -> the public file
-        return redirect(entry['url'])
-    if entry['path'] != subpath:
-        # "/folder" -> "/folder/"
-        return redirect(url_for('browse', subpath=entry['path']))
+    if subpath and not subpath.endswith('/'):
+        # "/folder/script.sh" -> the public file, "/folder" -> "/folder/", from the parent's listing
+        parent, _, name = subpath.rpartition('/')
+        parent = parent + '/' if parent else ''
+        target = find(folder_cache.get(parent), name)
+        if target is None:
+            target = find(folder_cache.get(parent, max_age=MISS_MAX_AGE), name)
+        if target is None:
+            abort(404)
+        return redirect(target)
+
+    listing = folder_cache.get(subpath)
+    if subpath and not listing.exists:
+        listing = folder_cache.get(subpath, max_age=MISS_MAX_AGE)
+        if not listing.exists:
+            abort(404)
 
     parts = subpath.rstrip('/').split('/') if subpath else []
     breadcrumbs = [
@@ -245,9 +246,9 @@ def browse(subpath):
     return render_template(
         'index.html',
         bucket_path=f'gs://{BUCKET_NAME}/{FOLDER_SRC}{subpath}',
-        folders=entry['folders'],
-        files=entry['files'],
-        total_size=entry['size'],
+        folders=listing.folders,
+        files=listing.files,
+        total_size=sum(file['size'] for file in listing.files),
         breadcrumbs=breadcrumbs,
         parent_url=parent_url if subpath else None,
     )
@@ -255,9 +256,9 @@ def browse(subpath):
 
 @app.route('/healthz')
 def healthz():
-    # Loads the copy the first time but never reloads it: monitoring costs no GCS requests
-    snapshot = bucket_index.snapshot or bucket_index.get()
-    return {'status': 'ok', 'objects': len(snapshot.files), 'age': round(snapshot.age)}
+    # Lists the root the first time but never refreshes it: monitoring costs no GCS requests
+    listing = folder_cache.listings.get('') or folder_cache.get('')
+    return {'status': 'ok', 'cached_folders': len(folder_cache.listings), 'age': round(listing.age)}
 
 
 @app.after_request

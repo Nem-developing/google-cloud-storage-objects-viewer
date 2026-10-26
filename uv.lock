@@ -400,7 +400,7 @@ wheels = [
 
 [[package]]
 name = "google-cloud-storage-objects-viewer"
-version = "2.2"
+version = "2.3"
 source = { virtual = "." }
 dependencies = [
     { name = "flask" },

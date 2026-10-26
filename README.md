@@ -13,7 +13,7 @@ breadcrumbs, folders first, sortable columns, instant filter (`/`), copy-link bu
 | `PUB_URL`     | no       | `https://storage.googleapis.com/prod-nehemiebarkia-publique` | `https://storage.googleapis.com/BUCKET_NAME` |
 | `TITLE`       | no       | `SCRIPTS RÉDIGÉS PAR BARKIA NEHEMIE`                         | `BUCKET_NAME`                                |
 | `TIMEZONE`    | no       | `Europe/Paris`                                               | `Europe/Paris`                               |
-| `CACHE_TTL`   | no       | `30`                                                         | `30` (seconds)                               |
+| `CACHE_TTL`   | no       | `60`                                                         | `60` (seconds)                               |
 | `PORT`        | no       | `8080`                                                       | `8080`                                       |
 
 Credentials: the bucket is read anonymously, which works when `allUsers` has the `Storage Object Viewer` role.
@@ -71,18 +71,16 @@ uv run pytest
 
 ## Speed & reliability
 
-- The whole `FOLDER_SRC` tree is kept in memory (one GCS request per 1000 objects): browsing never waits for GCS.
-  It is reloaded when older than `CACHE_TTL`, and right away when a path is unknown (just uploaded),
-  at most once every 5 seconds.
-- If GCS is unreachable, the last good copy keeps being served; requests to GCS time out after 10–15 s.
+- Only the displayed folder is listed (never the whole bucket), and each listing is kept `CACHE_TTL` seconds:
+  going back to a folder seen in the last minute doesn't wait for GCS.
+  An unknown path is listed again right away (just uploaded), at most once every 5 seconds.
+- If GCS is unreachable, the last good listings keep being served; requests to GCS time out after 10–15 s.
 - No credential lookup by default: outside Google Cloud it took ~12 s at startup.
 - Pages are gzipped, and Chrome / Edge prefetch a folder when its link is hovered.
-
-Meant for buckets up to a few tens of thousands of objects under `FOLDER_SRC`.
 
 ## Folders without placeholder objects
 
 GCS has no real folders. Before v2.0 a folder only showed up if an empty `folder/` object existed, which the console
 creates with "Create folder" but most tools (`gsutil cp -r`, `gcloud storage cp -r`, `rsync`, SDKs...) do not.
 Those folders (and everything inside them) were invisible until deleted and re-uploaded.
-Since v2.0 folders are derived from the object paths, so every folder is displayed however it was uploaded.
+Since v2.0 the listing uses the `/` delimiter, so every folder is displayed however it was uploaded.

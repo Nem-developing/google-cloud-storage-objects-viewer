@@ -13,5 +13,5 @@ docker run -d --name gcs-list --restart unless-stopped --env-file variables.env 
 #FOLDER_SRC = 'scripts/'
 #PUB_URL = 'https://storage.googleapis.com/prod-nehemiebarkia-publique'
 #TITLE = "SCRIPTS RÉDIGÉS PAR BARKIA NEHEMIE"
-#CACHE_TTL = 30
+#CACHE_TTL = 60
 ###

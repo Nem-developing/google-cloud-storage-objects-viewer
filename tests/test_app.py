@@ -22,31 +22,51 @@ OBJECTS = [
 
 
 class FakeBlob:
-    def __init__(self, name, day=1):
+    def __init__(self, name):
         self.name = name
         self.size = 0 if name.endswith('/') else 1024
-        self.time_created = self.updated = datetime.datetime(2024, 3, day, 12, 0, tzinfo=datetime.timezone.utc)
+        self.time_created = self.updated = datetime.datetime(2024, 3, 1, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+class FakeIterator:
+    def __init__(self, blobs, prefixes):
+        self.blobs = blobs
+        self.prefixes = prefixes
+
+    def __iter__(self):
+        return iter(self.blobs)
 
 
 class FakeClient:
+    """Mimics list_blobs: with a delimiter, deeper objects are rolled up into "prefixes"."""
+
     def __init__(self, names):
         self.blobs = [FakeBlob(name) for name in names]
-        self.calls = 0
+        self.calls = []
         self.error = None
         self.delay = 0
 
-    def list_blobs(self, bucket, prefix, **kwargs):
-        self.calls += 1
+    def list_blobs(self, bucket, prefix, delimiter=None, **kwargs):
+        self.calls.append((prefix, delimiter))
         time.sleep(self.delay)
         if self.error:
             raise self.error
-        return [blob for blob in self.blobs if blob.name.startswith(prefix)]
+        blobs, prefixes = [], set()
+        for blob in self.blobs:
+            if not blob.name.startswith(prefix):
+                continue
+            rest = blob.name[len(prefix):]
+            if delimiter and delimiter in rest:
+                prefixes.add(prefix + rest.split(delimiter)[0] + delimiter)
+            else:
+                blobs.append(blob)
+        return FakeIterator(blobs, prefixes)
 
 
 @pytest.fixture
 def gcs(monkeypatch):
     client = FakeClient(OBJECTS)
-    monkeypatch.setattr(viewer, 'bucket_index', viewer.BucketIndex(ttl=30, client=client))
+    monkeypatch.setattr(viewer, 'folder_cache', viewer.FolderCache(ttl=60, client=client))
     return client
 
 
@@ -55,8 +75,8 @@ def http(gcs):
     return viewer.app.test_client()
 
 
-def age_copy(seconds):
-    viewer.bucket_index.snapshot.loaded_at -= seconds
+def age_listing(path, seconds):
+    viewer.folder_cache.listings[path].loaded_at -= seconds
 
 
 def test_folders_without_placeholder_are_listed(http):
@@ -68,10 +88,19 @@ def test_folders_without_placeholder_are_listed(http):
     assert 'Mise à jour #1.bash' in http.get('/BASH/SUB/').text
 
 
+def test_only_the_displayed_folder_is_listed(http, gcs):
+    http.get('/BASH/SUB/')
+    assert gcs.calls == [('scripts/BASH/SUB/', '/')]
+    for path in ['/', '/BASH/', '/NEW/', '/a.sh', '/NOPE/']:
+        http.get(path)
+    assert all(delimiter == '/' for _, delimiter in gcs.calls)
+
+
 def test_empty_and_unknown_folders(http):
     assert 'Ce dossier est vide' in http.get('/EMPTY/').text
     assert http.get('/NOPE/').status_code == 404
     assert http.get('/NOPE').status_code == 404
+    assert http.get('/NOPE/x.sh').status_code == 404
 
 
 def test_redirects(http):
@@ -80,55 +109,58 @@ def test_redirects(http):
     assert response.location == 'https://pub.example/scripts/BASH/SUB/Mise%20%C3%A0%20jour%20%231.bash'
 
 
-def test_folder_totals(gcs):
-    folders = viewer.bucket_index.get().folders
-    assert (folders['']['count'], folders['']['size']) == (4, 4096)
-    assert (folders['BASH/']['count'], folders['BASH/']['size']) == (2, 2048)
-    assert folders['EMPTY/']['updated'] is None
-
-
-def test_browsing_uses_the_copy(http, gcs):
-    for path in ['/', '/BASH/', '/BASH/SUB/', '/NEW/', '/BASH', '/a.sh']:
+def test_listings_are_cached(http, gcs):
+    for path in ['/', '/BASH/', '/', '/BASH/', '/BASH', '/a.sh', '/BASH/x.sh']:
         http.get(path)
-    assert gcs.calls == 1
+    assert len(gcs.calls) == 2  # the redirects reuse the parent's listing
 
 
-def test_stale_copy_is_reloaded(http, gcs):
+def test_stale_listing_is_refreshed(http, gcs):
     http.get('/')
-    age_copy(31)
+    age_listing('', 61)
     http.get('/')
-    assert gcs.calls == 2
+    assert len(gcs.calls) == 2
 
 
 def test_new_upload_is_found_before_ttl(http, gcs):
-    http.get('/')
+    http.get('/FRESH/')
     gcs.blobs.append(FakeBlob('scripts/FRESH/new.sh'))
-    age_copy(6)
+    age_listing('FRESH/', 6)
     assert http.get('/FRESH/').status_code == 200
-    assert gcs.calls == 2
+    http.get('/BASH/')
+    gcs.blobs.append(FakeBlob('scripts/BASH/new.sh'))
+    age_listing('BASH/', 6)
+    assert http.get('/BASH/new.sh').status_code == 302
 
 
 def test_unknown_paths_do_not_hammer_gcs(http, gcs):
     for _ in range(20):
         http.get('/NOPE/')
-    assert gcs.calls == 1
+    assert len(gcs.calls) == 1
 
 
-def test_gcs_outage_serves_last_copy(http, gcs):
-    http.get('/')
+def test_memory_stays_bounded(http, monkeypatch):
+    monkeypatch.setattr(viewer, 'MAX_CACHED_FOLDERS', 10)
+    for index in range(50):
+        http.get(f'/random-{index}/')
+    assert len(viewer.folder_cache.listings) <= 10
+
+
+def test_gcs_outage_serves_last_listing(http, gcs):
+    http.get('/BASH/')
     gcs.error = ServiceUnavailable('down')
-    age_copy(31)
+    age_listing('BASH/', 61)
     for _ in range(5):
         response = http.get('/BASH/')
         assert response.status_code == 200 and 'x.sh' in response.text
-    assert gcs.calls == 2  # one failed reload, then RETRY_DELAY before the next attempt
+    assert len(gcs.calls) == 2  # one failed refresh, then RETRY_DELAY before the next attempt
 
 
-def test_gcs_outage_without_copy(http, gcs):
+def test_gcs_outage_without_listing(http, gcs):
     gcs.error = ServiceUnavailable('down')
     assert http.get('/').status_code == 502
     gcs.error = None
-    viewer.bucket_index.retry_at = 0
+    viewer.folder_cache.retry_at = 0
     assert http.get('/').status_code == 200
 
 
@@ -137,19 +169,17 @@ def test_private_listing_falls_back_to_credentials(http, gcs, monkeypatch):
     authenticated = FakeClient(OBJECTS)
     monkeypatch.setattr(viewer.storage, 'Client', lambda: authenticated)
     assert http.get('/').status_code == 200
-    assert authenticated.calls == 1
+    assert len(authenticated.calls) == 1
 
 
-def test_concurrent_requests_share_one_reload(gcs):
-    viewer.bucket_index.get()
-    age_copy(31)
+def test_concurrent_requests_share_one_listing(gcs):
     gcs.delay = 0.2
-    threads = [threading.Thread(target=viewer.bucket_index.get) for _ in range(10)]
+    threads = [threading.Thread(target=viewer.folder_cache.get, args=('BASH/',)) for _ in range(10)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    assert gcs.calls == 2
+    assert len(gcs.calls) == 1
 
 
 def test_gzip(http):
@@ -159,8 +189,8 @@ def test_gzip(http):
     assert 'Content-Encoding' not in http.get('/').headers
 
 
-def test_healthz_never_reloads(http, gcs):
-    assert http.get('/healthz').json['objects'] == 4
-    age_copy(3600)
+def test_healthz_never_refreshes(http, gcs):
+    assert http.get('/healthz').json['status'] == 'ok'
+    age_listing('', 3600)
     assert http.get('/healthz').status_code == 200
-    assert gcs.calls == 1
+    assert len(gcs.calls) == 1

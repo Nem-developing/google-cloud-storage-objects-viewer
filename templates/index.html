@@ -7,8 +7,7 @@
 <span>
     {%- if folders %}{{ folders|length }} dossier{{ 's' if folders|length > 1 }}{% endif %}
     {%- if folders and files %} · {% endif %}
-    {%- if files %}{{ files|length }} fichier{{ 's' if files|length > 1 }}{% endif %}
-    {%- if total_size %} · {{ total_size|human_size }}{% endif %}
+    {%- if files %}{{ files|length }} fichier{{ 's' if files|length > 1 }} · {{ total_size|human_size }}{% endif %}
     {%- if not folders and not files %}Dossier vide{% endif -%}
 </span>
 {% endblock %}
@@ -63,25 +62,16 @@
         {% endif %}
         <tbody id="entries">
             {% for folder in folders %}
-            <tr data-type="0" data-name="{{ folder.name }}" data-size="{{ folder.size }}" data-updated="{{ folder.updated.isoformat() if folder.updated }}">
+            <tr data-type="0" data-name="{{ folder.name }}">
                 <td>
                     <a class="entry is-folder" href="{{ url_for('browse', subpath=folder.path) }}">
                         <span class="icon k-folder"><svg class="i"><use href="#i-folder"/></svg></span>
-                        <span class="text">
-                            <span class="label">{{ folder.name }}</span>
-                            <span class="mobile-meta">{% if folder.count %}{{ folder.count }} fichier{{ 's' if folder.count > 1 }}{% else %}Vide{% endif %}</span>
-                        </span>
+                        <span class="text"><span class="label">{{ folder.name }}</span></span>
                     </a>
                 </td>
-                {% if folder.count %}
-                <td class="num">{{ folder.size|human_size }}</td>
-                <td class="date dim col-created">—</td>
-                <td class="date col-updated"><time datetime="{{ folder.updated.isoformat() }}" title="Dernière modification d'un fichier du dossier">{{ folder.updated|french_date }}</time></td>
-                {% else %}
                 <td class="num dim">—</td>
                 <td class="date dim col-created">—</td>
                 <td class="date dim col-updated">—</td>
-                {% endif %}
                 <td class="actions"></td>
             </tr>
             {% endfor %}
