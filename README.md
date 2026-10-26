@@ -65,13 +65,6 @@ Tests:
 uv run pytest
 ```
 
-## URLs
-
-- `/BASH/INSTALLATIONS/` lists a folder.
-- `/BASH/INSTALLATIONS/LAMP.sh` redirects to the public URL of the file, handy for
-  `curl -sL https://your-site/BASH/INSTALLATIONS/LAMP.sh | bash`.
-- `/healthz` returns `{"status": "ok", "objects": …, "age": …}` for monitoring (502 if the bucket can't be read).
-
 ## Speed & reliability
 
 - Only the displayed folder is listed (never the whole bucket), and each listing is kept `CACHE_TTL` seconds:
